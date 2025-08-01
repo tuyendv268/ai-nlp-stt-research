@@ -1,0 +1,17 @@
+data
+__pycache__
+logs
+outputs
+pretrained
+text_corpus
+.env
+lightning_logs
+exp
+cache
+invert_norm_ckpt
+mfcc_pitch
+tokenizers
+*.wav
+*.jsonl
+output
+*.tar.gz

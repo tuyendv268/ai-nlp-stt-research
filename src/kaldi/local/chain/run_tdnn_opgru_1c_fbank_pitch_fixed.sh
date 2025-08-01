@@ -1,0 +1,205 @@
+#!/bin/bash
+set -e
+
+# configs for 'chain'
+# stage=0
+num_leaves=5000
+train_stage=-10
+get_egs_stage=-10
+
+# TDNN options
+frames_per_eg=150,110,100
+remove_egs=false
+common_egs_dir=
+xent_regularize=0.1
+dropout_schedule='0,0@0.20,0.2@0.50,0'
+
+# End configuration section.
+echo "$0 $@"  # Print the command line for logging
+
+. ./cmd.sh
+. ./path.sh
+. ./utils/parse_options.sh
+
+if ! cuda-compiled; then
+  cat <<EOF && exit 1
+This script is intended to be used with GPUs but you have not compiled Kaldi with CUDA
+If you want to use GPUs (and have them), go to src/, and configure and make on a machine
+where "nvcc" is installed.
+EOF
+fi
+
+#################
+dir=$1 # Working DNN dir for this setup
+lang=$2 # DNN lang topo (1 stage HMM)
+langtrain=$3 # Reference Lang for DNN training, should be the HMM-GMM lang training.
+train_set_for_tree=$4 #Data used that associates with the input Alignments
+gmm_dir=$5 # GMM-HMM model dir for tree tranining
+ali_dir=$6 # Alignment dir for tree training
+lat_dir=$7 # Lattices dir that have to associate with train_data_dir (MFCC-Hires)
+train_data_dir=$8 # The input data for DNN training, should be argumented data in kind of MFCC-Hires feature
+train_ivector_dir=$9 #The i-vector data that associate with train_data_dir (MFCC-Hires), and extracted from script 10.Extract_ivector_pca
+extractor=${10} # The i-vector extractor
+train_stage=${11}
+get_egs_stage=${12}
+stage=${13}
+num_epoch=${14} # Number of epoches for DNN training (should be more than 3)
+init_num_jobs=${15} # Number of paralell jobs at begining of DNN training 
+final_num_jobs=${16} # Number of paralell jobs at lats epoch of DNN training. Careful on GPU-Mem = final_num_jobs * size_of_one_job
+minibatch=${17} # minibatch sizes, like: 128,64
+init_LrRate=${18} # initial learning rate
+final_LrRate=${19} # final learning rate
+trained_model=${20} # pre-trained model that have to be the same topo, set to None to skip it
+cuda_devices=${21}
+#################
+tree_dir=$(dirname ${dir})/chain/$(basename ${gmm_dir})_tree
+
+if [ $stage -le 0 ]; then
+  for f in $gmm_dir/final.mdl $train_data_dir/feats.scp $train_ivector_dir/ivector_online.scp \
+      $train_set_for_tree/feats.scp $ali_dir/ali.1.gz; do
+    [ ! -f $f ] && echo "$0: expected file $f to exist" && exit 1
+  done
+fi
+
+if [ $stage -le 1 ]; then
+  echo =============debug1================
+  echo "$0: creating lang directory $lang with chain-type topology"
+  # Create a version of the lang/ directory that has one state per phone in the
+  # topo file. [note, it really has two states.. the first one is only repeated
+  # once, the second one has zero or more repeats.]
+  if [ -d $lang ]; then
+    if [ $lang/L.fst -nt ${langtrain}/L.fst ]; then
+      echo "$0: $lang already exists, not overwriting it; continuing"
+    else
+      echo "$0: $lang already exists and seems to be older than data/lang..."
+      echo " ... not sure what to do.  Exiting."
+      exit 1;
+    fi
+  else
+    cp -r ${langtrain} $lang
+    silphonelist=$(cat $lang/phones/silence.csl) || exit 1;
+    nonsilphonelist=$(cat $lang/phones/nonsilence.csl) || exit 1;
+    # Use our special topology... note that later on may have to tune this
+    # topology.
+    steps/nnet3/chain/gen_topo.py $nonsilphonelist $silphonelist >$lang/topo
+  fi
+fi
+
+if [ $stage -le 2 ]; then
+  # Build a tree using our new topology. We know we have alignments for the
+  # speed-perturbed data (local/nnet3/run_ivector_common.sh made them), so use
+  # those.
+  if [ -f $tree_dir/final.mdl ]; then
+    echo "$0: $tree_dir/final.mdl already exists, refusing to overwrite it."
+    exit 1;
+  fi
+  steps/nnet3/chain/build_tree.sh --frame-subsampling-factor 3 \
+      --context-opts "--context-width=2 --central-position=1" \
+      --cmd "$train_cmd" $num_leaves ${train_set_for_tree} $lang $ali_dir $tree_dir || exit 1;
+fi
+
+if [ $stage -le 3 ]; then
+  echo "$0: creating neural net configs using the xconfig parser";
+
+  num_targets=$(tree-info $tree_dir/tree | grep num-pdfs | awk '{print $2}')
+  learning_rate_factor=$(echo "print (0.5/$xent_regularize)" | python)
+  gru_opts="dropout-per-frame=true dropout-proportion=0.0"
+  label_delay=5
+  #cnn_opts="l2-regularize=0.01"
+  #ivector_affine_opts="l2-regularize=0.0"
+  #affine_opts="l2-regularize=0.008 dropout-proportion=0.0 dropout-per-dim=true dropout-per-dim-continuous=true"
+  #tdnnf_first_opts="l2-regularize=0.008 dropout-proportion=0.0 bypass-scale=0.0"
+  #tdnnf_opts="l2-regularize=0.008 dropout-proportion=0.0 bypass-scale=1.0"
+  #linear_opts="l2-regularize=0.008 orthonormal-constraint=-1.0"
+  #prefinal_opts="l2-regularize=0.008"
+  #output_opts="l2-regularize=0.005"
+  
+
+  # lstm_opts="decay-time=40"
+
+  mkdir -p $dir/configs
+  cat <<EOF > $dir/configs/network.xconfig
+
+  input dim=26 name=input
+
+  # please note that it is important to have input layer with the name=input
+  # as the layer immediately preceding the fixed-affine-layer to enable
+  # the use of short notation for the descriptor
+  # fixed-affine-layer name=lda input=Append(-2,-1,0,1,2) affine-transform-file=$dir/configs/lda.mat
+
+  # the first splicing is moved before the lda layer, so no splicing here
+  relu-batchnorm-layer name=tdnn1 dim=256
+  relu-batchnorm-layer name=tdnn2 input=Append(-1,0,1) dim=256
+  relu-batchnorm-layer name=tdnn3 input=Append(-1,0,1) dim=256
+  # check steps/libs/nnet3/xconfig/gru.py for the other options and defaults
+  norm-opgru-layer name=opgru1 cell-dim=256 recurrent-projection-dim=128 non-recurrent-projection-dim=128 delay=-3 $gru_opts
+  relu-batchnorm-layer name=tdnn4 input=Append(-3,0,3) dim=256
+  relu-batchnorm-layer name=tdnn5 input=Append(-3,0,3) dim=256
+  relu-batchnorm-layer name=tdnn6 input=Append(-3,0,3) dim=256
+  norm-opgru-layer name=opgru2 cell-dim=256 recurrent-projection-dim=128 non-recurrent-projection-dim=128 delay=-3 $gru_opts
+  relu-batchnorm-layer name=tdnn7 input=Append(-3,0,3) dim=256
+  relu-batchnorm-layer name=tdnn8 input=Append(-3,0,3) dim=256
+  relu-batchnorm-layer name=tdnn9 input=Append(-3,0,3) dim=256
+  norm-opgru-layer name=opgru3 cell-dim=256 recurrent-projection-dim=128 non-recurrent-projection-dim=128 delay=-3 $gru_opts
+  ## adding the layers for chain branch
+  output-layer name=output input=opgru3 output-delay=$label_delay include-log-softmax=false dim=$num_targets max-change=1.5
+  # adding the layers for xent branch
+  # This block prints the configs for a separate output that will be
+  # trained with a cross-entropy objective in the 'chain' models... this
+  # has the effect of regularizing the hidden parts of the model.  we use
+  # 0.5 / args.xent_regularize as the learning rate factor- the factor of
+  # 0.5 / args.xent_regularize is suitable as it means the xent
+  # final-layer learns at a rate independent of the regularization
+  # constant; and the 0.5 was tuned so as to make the relative progress
+  # similar in the xent and regular final layers.
+  output-layer name=output-xent input=opgru3 output-delay=$label_delay dim=$num_targets learning-rate-factor=$learning_rate_factor max-change=1.5
+
+
+EOF
+
+  steps/nnet3/xconfig_to_configs.py --xconfig-file $dir/configs/network.xconfig --config-dir $dir/configs/
+fi
+
+if [ $stage -le 4 ]; then
+  echo =============debug4================
+  steps/nnet3/chain/train.py --stage $train_stage \
+    --trainer.input-model ${trained_model} \
+    --use-gpu "wait" \
+    --cmd "$decode_cmd" \
+    --feat.online-ivector-dir "" \
+    --feat.cmvn-opts "--norm-means=false --norm-vars=false" \
+    --chain.xent-regularize $xent_regularize \
+    --chain.leaky-hmm-coefficient 0.1 \
+    --chain.l2-regularize 0.0 \
+    --chain.apply-deriv-weights false \
+    --chain.lm-opts="--num-extra-lm-states=2000" \
+    --egs.dir "$common_egs_dir" \
+    --egs.stage $get_egs_stage \
+    --egs.opts "--frames-overlap-per-eg 0 --constrained false" \
+    --egs.chunk-width $frames_per_eg \
+    --trainer.dropout-schedule $dropout_schedule \
+    --trainer.add-option="--optimization.memory-compression-level=2" \
+    --trainer.num-chunk-per-minibatch ${minibatch} \
+    --trainer.frames-per-iter 2500000 \
+    --trainer.num-epochs ${num_epoch} \
+    --trainer.optimization.num-jobs-initial ${init_num_jobs} \
+    --trainer.optimization.num-jobs-final ${final_num_jobs} \
+    --trainer.optimization.initial-effective-lrate ${init_LrRate} \
+    --trainer.optimization.final-effective-lrate ${final_LrRate} \
+    --trainer.max-param-change 2.0 \
+    --cleanup.remove-egs $remove_egs \
+    --feat-dir $train_data_dir \
+    --tree-dir $tree_dir \
+    --lat-dir $lat_dir \
+    --cuda-devices ${cuda_devices} \
+    --dir $dir  || exit 1;
+
+fi
+
+if [ $stage -le 5 ]; then
+  echo =============debug5================
+    steps/online/nnet3/prepare_online_decoding.sh \
+       --mfcc-config conf/mfcc_hires.conf \
+       $langtrain $extractor $dir ${dir}_online || exit 1;
+fi
+exit 0;
