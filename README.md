@@ -3,7 +3,8 @@
 ```
 - Folder: src/pipeline
     + Perform forced alignment, and verify and clean the speech-to-text data. 
-    Create speech-to-text data using voice cloning and text-to-speech.
+    + Create speech-to-text data using voice cloning and text-to-speech.
+    + Run:
         * s1_segment_audio_with_vad.py
         * s2_run_nemo_stt.sh, s2_run_stt_data.py
         * s1_segment_audio_with_vad.py
